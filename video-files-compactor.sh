@@ -1,7 +1,7 @@
-vcheck()
+video-info()
 {
     if [ "$#" -ne 1 ]; then
-        echo "Usage: vcheck FILE" >&2
+        echo "Usage: video-info FILE" >&2
         return 2
     fi
 
@@ -282,8 +282,41 @@ video-splicer()
 {
     local module_cache
 
+    if [ "$#" -eq 2 ] && [ "$2" = "save" ]; then
+        local input=$1
+        local stem extension original
+
+        if [ ! -f "$input" ]; then
+            echo "Not a file: $input" >&2
+            return 1
+        fi
+
+        case $input in
+            *-spliced.mov|*-spliced.mp4|*-spliced.MOV|*-spliced.MP4)
+                ;;
+            *)
+                echo "Refusing to save: filename must end in -spliced.mov or -spliced.mp4" >&2
+                return 2
+                ;;
+        esac
+
+        stem=${input%.*}
+        extension=${input##*.}
+        original=${stem%-spliced}.$extension
+
+        if [ ! -f "$original" ]; then
+            echo "Original file does not exist: $original" >&2
+            return 1
+        fi
+
+        command mv -f "$input" "$original" || return 1
+        printf '%s\n' "$original"
+        return 0
+    fi
+
     if [ "$#" -lt 2 ]; then
         echo "Usage: video-splicer FILENAME START,END [START,END ...] [FINAL_START]" >&2
+        echo "       video-splicer FILENAME-spliced.mov save" >&2
         return 2
     fi
 
