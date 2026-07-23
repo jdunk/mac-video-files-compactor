@@ -304,11 +304,6 @@ video-splicer()
         extension=${input##*.}
         original=${stem%-spliced}.$extension
 
-        if [ ! -f "$original" ]; then
-            echo "Original file does not exist: $original" >&2
-            return 1
-        fi
-
         command mv -f "$input" "$original" || return 1
         printf '%s\n' "$original"
         return 0
