@@ -278,39 +278,73 @@ _video_files_compactor_dir=$(
     cd "$(dirname "$_video_files_compactor_source")" && pwd -P
 )
 
+_video_splicer_state_file()
+{
+    local state_dir
+
+    state_dir=${VIDEO_FILES_COMPACTOR_STATE_DIR:-"$HOME/Library/Application Support/video-files-compactor"}
+    mkdir -p "$state_dir" || return 1
+    printf '%s/last-spliced\n' "$state_dir"
+}
+
+_video_splicer_save()
+{
+    local input=$1
+    local state_file=$2
+    local stem extension original
+
+    if [ ! -f "$input" ]; then
+        echo "Not a file: $input" >&2
+        return 1
+    fi
+
+    case $input in
+        *-spliced.mov|*-spliced.mp4|*-spliced.MOV|*-spliced.MP4)
+            ;;
+        *)
+            echo "Refusing to save: filename must end in -spliced.mov or -spliced.mp4" >&2
+            return 2
+            ;;
+    esac
+
+    stem=${input%.*}
+    extension=${input##*.}
+    original=${stem%-spliced}.$extension
+
+    command mv -f "$input" "$original" || return 1
+    printf '%s\n' "$original"
+
+    if [ -n "$state_file" ]; then
+        : > "$state_file"
+    fi
+}
+
 video-splicer()
 {
-    local module_cache
+    local module_cache state_file input output status
 
-    if [ "$#" -eq 2 ] && [ "$2" = "save" ]; then
-        local input=$1
-        local stem extension original
+    if [ "$#" -eq 1 ] && [ "$1" = "save" ]; then
+        state_file=$(_video_splicer_state_file) || return 1
 
-        if [ ! -f "$input" ]; then
-            echo "Not a file: $input" >&2
+        if [ ! -s "$state_file" ]; then
+            echo "No recently spliced file is waiting to be saved." >&2
             return 1
         fi
 
-        case $input in
-            *-spliced.mov|*-spliced.mp4|*-spliced.MOV|*-spliced.MP4)
-                ;;
-            *)
-                echo "Refusing to save: filename must end in -spliced.mov or -spliced.mp4" >&2
-                return 2
-                ;;
-        esac
+        IFS= read -r input < "$state_file"
+        _video_splicer_save "$input" "$state_file"
+        return
+    fi
 
-        stem=${input%.*}
-        extension=${input##*.}
-        original=${stem%-spliced}.$extension
-
-        command mv -f "$input" "$original" || return 1
-        printf '%s\n' "$original"
-        return 0
+    if [ "$#" -eq 2 ] && [ "$2" = "save" ]; then
+        state_file=$(_video_splicer_state_file) || return 1
+        _video_splicer_save "$1" "$state_file"
+        return
     fi
 
     if [ "$#" -lt 2 ]; then
         echo "Usage: video-splicer FILENAME START,END [START,END ...] [FINAL_START]" >&2
+        echo "       video-splicer save" >&2
         echo "       video-splicer FILENAME-spliced.mov save" >&2
         return 2
     fi
@@ -323,8 +357,20 @@ video-splicer()
     module_cache=${TMPDIR:-/tmp}/video-splicer-module-cache
     mkdir -p "$module_cache" || return 1
 
-    swift -module-cache-path "$module_cache" \
-        "$_video_files_compactor_dir/video-splicer.swift" "$@"
+    output=$(
+        swift -module-cache-path "$module_cache" \
+            "$_video_files_compactor_dir/video-splicer.swift" "$@"
+    )
+    status=$?
+    printf '%s\n' "$output"
+
+    if [ "$status" -ne 0 ]; then
+        return "$status"
+    fi
+
+    input=${output%%$'\n'*}
+    state_file=$(_video_splicer_state_file) || return 1
+    printf '%s\n' "$input" > "$state_file"
 }
 
 video-concat()
