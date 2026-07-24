@@ -123,6 +123,60 @@ _video_compact_check()
         echo "ffmpeg not found" >&2
         return 127
     }
+
+    command -v ffprobe >/dev/null 2>&1 || {
+        echo "ffprobe not found" >&2
+        return 127
+    }
+}
+
+_video_compact_progress()
+{
+    local duration=$1
+
+    awk -F= -v duration="$duration" '
+        function clock(seconds, hours, minutes) {
+            if (seconds < 0)
+                seconds = 0
+
+            seconds = int(seconds + 0.5)
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            seconds %= 60
+            return sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+        }
+
+        $1 == "out_time" {
+            split($2, parts, ":")
+            elapsed = parts[1] * 3600 + parts[2] * 60 + parts[3]
+        }
+
+        $1 == "speed" {
+            speed = $2
+            sub(/x$/, "", speed)
+        }
+
+        $1 == "progress" {
+            percent = duration > 0 ? elapsed * 100 / duration : 0
+            if (percent > 100 || $2 == "end")
+                percent = 100
+
+            if (speed > 0) {
+                eta = clock((duration - elapsed) / speed)
+                speed_text = sprintf("%.2fx", speed)
+            } else {
+                eta = "--:--:--"
+                speed_text = "--"
+            }
+
+            printf "\r\033[KProgress: %5.1f%% | %s / %s | %s | ETA %s", \
+                percent, clock(elapsed), clock(duration), speed_text, eta
+            fflush()
+
+            if ($2 == "end")
+                printf "\n"
+        }
+    '
 }
 
 _video_compact_trash()
@@ -160,7 +214,8 @@ _video_compact_replace()
     _video_compact_check "$command_name" "$input" || return
 
     local absolute_input directory filename stem extension temp
-    local original_size new_size saved
+    local original_size new_size saved duration
+    local progress_dir progress_pipe progress_pid ffmpeg_status
 
     directory=$(cd "$(dirname "$input")" && pwd -P) || return 1
     filename=${input##*/}
@@ -182,14 +237,47 @@ _video_compact_replace()
     original_size=$(stat -f '%z' "$absolute_input" 2>/dev/null ||
                     stat -c '%s' "$absolute_input" 2>/dev/null) || return 1
 
-    if ! ffmpeg -y -i "$absolute_input" \
+    duration=$(ffprobe -v error \
+        -show_entries format=duration \
+        -of default=nw=1:nk=1 \
+        "$absolute_input")
+
+    if [ -z "$duration" ] ||
+       [ "$duration" = "N/A" ] ||
+       ! awk -v n="$duration" 'BEGIN { exit !(n > 0) }'
+    then
+        echo "Could not determine duration: $absolute_input" >&2
+        return 1
+    fi
+
+    progress_dir=$(mktemp -d "${TMPDIR:-/tmp}/video-compact-progress.XXXXXX") ||
+        return 1
+    progress_pipe=$progress_dir/ffmpeg-progress
+
+    if ! mkfifo "$progress_pipe"; then
+        rmdir "$progress_dir"
+        return 1
+    fi
+
+    _video_compact_progress "$duration" < "$progress_pipe" >&2 &
+    progress_pid=$!
+
+    ffmpeg -hide_banner -loglevel error \
+        -stats_period 0.5 -progress "$progress_pipe" -nostats \
+        -y -i "$absolute_input" \
         -map 0:v:0 -map '0:a?' -map_metadata 0 \
         -vf fps=30 \
         "$@" \
         -c:a aac -b:a 160k \
         -movflags +faststart \
         "$temp"
-    then
+    ffmpeg_status=$?
+
+    wait "$progress_pid"
+    unlink "$progress_pipe"
+    rmdir "$progress_dir"
+
+    if [ "$ffmpeg_status" -ne 0 ]; then
         echo "Compression failed; original left untouched: $absolute_input" >&2
         return 1
     fi
