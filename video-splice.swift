@@ -12,7 +12,7 @@ enum SpliceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .usage:
-            return "Usage: video-splicer FILENAME START,END [START,END ...] [FINAL_START]"
+            return "Usage: video-splice FILENAME START,END [START,END ...] [FINAL_START]"
         case .unsupportedExtension(let ext):
             return "Only .mov and .mp4 output is supported (got .\(ext))."
         case .invalidTime(let value):
@@ -205,7 +205,7 @@ Task {
         try await spliceVideo()
         exit(0)
         } catch {
-            fputs("video-splicer: \(error.localizedDescription)\n", stderr)
+            fputs("video-splice: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
 }

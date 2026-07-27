@@ -133,8 +133,9 @@ _video_compact_check()
 _video_compact_progress()
 {
     local duration=$1
+    local batch_status=${2:-}
 
-    awk -F= -v duration="$duration" '
+    awk -F= -v duration="$duration" -v batch_status="$batch_status" '
         function clock(seconds, hours, minutes) {
             if (seconds < 0)
                 seconds = 0
@@ -152,8 +153,13 @@ _video_compact_progress()
         }
 
         $1 == "speed" {
-            speed = $2
-            sub(/x$/, "", speed)
+            speed_value = $2
+            sub(/x$/, "", speed_value)
+
+            if (speed_value ~ /^[0-9]+([.][0-9]+)?$/)
+                speed = speed_value + 0
+            else
+                speed = 0
         }
 
         $1 == "progress" {
@@ -161,7 +167,7 @@ _video_compact_progress()
             if (percent > 100 || $2 == "end")
                 percent = 100
 
-            if (speed > 0) {
+            if ((speed + 0) > 0) {
                 eta = clock((duration - elapsed) / speed)
                 speed_text = sprintf("%.2fx", speed)
             } else {
@@ -169,7 +175,10 @@ _video_compact_progress()
                 speed_text = "--"
             }
 
-            printf "\r\033[KProgress: %5.1f%% | %s / %s | %s | ETA %s", \
+            printf "\r\033[K"
+            if (batch_status != "")
+                printf "%s | ", batch_status
+            printf "Video: %5.1f%% | %s / %s | %s | ETA %s", \
                 percent, clock(elapsed), clock(duration), speed_text, eta
             fflush()
 
@@ -259,21 +268,30 @@ _video_compact_replace()
         return 1
     fi
 
-    _video_compact_progress "$duration" < "$progress_pipe" >&2 &
-    progress_pid=$!
+    (
+        set +m 2>/dev/null
 
-    ffmpeg -hide_banner -loglevel error \
-        -stats_period 0.5 -progress "$progress_pipe" -nostats \
-        -y -i "$absolute_input" \
-        -map 0:v:0 -map '0:a?' -map_metadata 0 \
-        -vf fps=30 \
-        "$@" \
-        -c:a aac -b:a 160k \
-        -movflags +faststart \
-        "$temp"
+        _video_compact_progress \
+            "$duration" "${_video_compact_batch_status:-}" \
+            < "$progress_pipe" >&2 &
+        progress_pid=$!
+
+        ffmpeg -nostdin -hide_banner -loglevel error \
+            -stats_period 0.5 -progress "$progress_pipe" -nostats \
+            -y -i "$absolute_input" \
+            -map 0:v:0 -map '0:a?' -map_metadata 0 \
+            -vf fps=30 \
+            "$@" \
+            -c:a aac -b:a 160k \
+            -movflags +faststart \
+            "$temp"
+        ffmpeg_status=$?
+
+        wait "$progress_pid"
+        exit "$ffmpeg_status"
+    )
     ffmpeg_status=$?
 
-    wait "$progress_pid"
     unlink "$progress_pipe"
     rmdir "$progress_dir"
 
@@ -321,40 +339,232 @@ _video_compact_replace()
     '
 }
 
-video-compact-hvc()
+_video_compact_one()
 {
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: video-compact-hvc FILE" >&2
-        return 2
+    local mode=$1
+    local file=$2
+
+    case $mode in
+        hvc)
+            _video_compact_replace "video-compact-hvc" "$file" \
+                -c:v hevc_videotoolbox -q:v 60 -tag:v hvc1
+            ;;
+        slow)
+            _video_compact_replace "video-compact-slow" "$file" \
+                -c:v libx264 -preset slow -crf 23
+            ;;
+        medium)
+            _video_compact_replace "video-compact-medium" "$file" \
+                -c:v libx264 -preset medium -crf 23
+            ;;
+        *)
+            echo "Unknown compression mode: $mode" >&2
+            return 2
+            ;;
+    esac
+}
+
+_video_compact_batch_status()
+{
+    local processed=$1
+    local total=$2
+    local compressed=$3
+    local skipped=$4
+    local failed=$5
+    local remaining=$((total - processed))
+
+    printf 'Batch: %d/%d done | %d remaining | %d compressed | %d skipped | %d failed' \
+        "$processed" "$total" "$remaining" "$compressed" "$skipped" "$failed"
+}
+
+_video_compact_batch()
+{
+    local command_name=$1
+    local mode=$2
+    local directory=$3
+    local order=$4
+    local candidate extension size
+    local count=0 i j key_file key_size
+    local processed=0 compressed=0 skipped=0 failed=0
+    local assessment file_failed
+    local -a files sizes
+
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        setopt local_options ksh_arrays
     fi
 
-    _video_compact_replace "video-compact-hvc" "$@" \
-        -c:v hevc_videotoolbox -q:v 60 -tag:v hvc1
+    directory=$(cd "$directory" && pwd -P) || return 1
+
+    for candidate in "$directory"/*; do
+        [ -f "$candidate" ] || continue
+
+        extension=${candidate##*.}
+        extension=$(printf '%s' "$extension" | tr '[:upper:]' '[:lower:]')
+        case $extension in
+            mov|mp4)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        size=$(stat -f '%z' "$candidate" 2>/dev/null ||
+               stat -c '%s' "$candidate" 2>/dev/null) || {
+            echo "Could not determine file size: $candidate" >&2
+            continue
+        }
+
+        files[$count]=$candidate
+        sizes[$count]=$size
+        count=$((count + 1))
+    done
+
+    if [ "$count" -eq 0 ]; then
+        echo "No .mov or .mp4 files found in: $directory"
+        return 0
+    fi
+
+    # In-memory insertion sort keeps filenames intact, including whitespace.
+    i=1
+    while [ "$i" -lt "$count" ]; do
+        key_file=${files[$i]}
+        key_size=${sizes[$i]}
+        j=$((i - 1))
+
+        while [ "$j" -ge 0 ]; do
+            if [ "$order" = "smallest" ]; then
+                [ "${sizes[$j]}" -gt "$key_size" ] || break
+            else
+                [ "${sizes[$j]}" -lt "$key_size" ] || break
+            fi
+
+            files[$((j + 1))]=${files[$j]}
+            sizes[$((j + 1))]=${sizes[$j]}
+            j=$((j - 1))
+        done
+
+        files[$((j + 1))]=$key_file
+        sizes[$((j + 1))]=$key_size
+        i=$((i + 1))
+    done
+
+    printf '%s\n' "$(_video_compact_batch_status 0 "$count" 0 0 0)"
+
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        candidate=${files[$i]}
+        file_failed=0
+        printf '\n[%d/%d] %s\n' "$((i + 1))" "$count" "$candidate"
+
+        assessment=$(
+            video-info "$candidate" 2>/dev/null |
+                awk -F':  +' '/^  Assessment:/ { print $2 }'
+        )
+
+        if [ "$assessment" = "OK" ]; then
+            skipped=$((skipped + 1))
+            processed=$((processed + 1))
+            echo "Skipped: video is already compressed"
+        else
+            _video_compact_batch_status=$(
+                _video_compact_batch_status \
+                    "$processed" "$count" "$compressed" "$skipped" "$failed"
+            )
+
+            if _video_compact_one "$mode" "$candidate"; then
+                compressed=$((compressed + 1))
+            else
+                failed=$((failed + 1))
+                file_failed=1
+                echo "Failed: $candidate" >&2
+            fi
+
+            unset _video_compact_batch_status
+            processed=$((processed + 1))
+        fi
+
+        printf '%s\n' "$(
+            _video_compact_batch_status \
+                "$processed" "$count" "$compressed" "$skipped" "$failed"
+        )"
+
+        if [ "$file_failed" -eq 1 ]; then
+            echo "Pausing 3 seconds after failure; press Ctrl-C to stop the batch." >&2
+            sleep 3 || return 130
+        fi
+
+        i=$((i + 1))
+    done
+
+    printf '\nBatch complete: %d total | %d compressed | %d skipped | %d failed\n' \
+        "$count" "$compressed" "$skipped" "$failed"
+
+    [ "$failed" -eq 0 ]
+}
+
+_video_compact_entry()
+{
+    local command_name=$1
+    local mode=$2
+    shift 2
+
+    local target order=largest
+
+    case $# in
+        1)
+            target=$1
+            ;;
+        2)
+            if [ "$1" = "--reverse" ] || [ "$1" = "--smallest-first" ]; then
+                order=smallest
+                target=$2
+            elif [ "$2" = "--reverse" ] || [ "$2" = "--smallest-first" ]; then
+                order=smallest
+                target=$1
+            else
+                echo "Usage: $command_name FILE" >&2
+                echo "       $command_name DIR [--reverse|--smallest-first]" >&2
+                return 2
+            fi
+            ;;
+        *)
+            echo "Usage: $command_name FILE" >&2
+            echo "       $command_name DIR [--reverse|--smallest-first]" >&2
+            return 2
+            ;;
+    esac
+
+    if [ -d "$target" ]; then
+        _video_compact_batch "$command_name" "$mode" "$target" "$order"
+    elif [ -f "$target" ]; then
+        if [ "$order" != "largest" ]; then
+            echo "--reverse and --smallest-first apply only to directory mode." >&2
+            return 2
+        fi
+        _video_compact_one "$mode" "$target"
+    else
+        echo "Not a file or directory: $target" >&2
+        return 1
+    fi
+}
+
+video-compact-hvc()
+{
+    _video_compact_entry "video-compact-hvc" hvc "$@"
 }
 
 video-compact-slow()
 {
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: video-compact-slow FILE" >&2
-        return 2
-    fi
-
-    _video_compact_replace "video-compact-slow" "$@" \
-        -c:v libx264 -preset slow -crf 23
+    _video_compact_entry "video-compact-slow" slow "$@"
 }
 
 video-compact-medium()
 {
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: video-compact-medium FILE" >&2
-        return 2
-    fi
-
-    _video_compact_replace "video-compact-medium" "$@" \
-        -c:v libx264 -preset medium -crf 23
+    _video_compact_entry "video-compact-medium" medium "$@"
 }
 
 alias video-compact='video-compact-hvc'
+alias video-compactor='video-compact'
 
 if [ -n "${BASH_VERSION:-}" ]; then
     _video_files_compactor_source=${BASH_SOURCE[0]}
@@ -366,40 +576,46 @@ _video_files_compactor_dir=$(
     cd "$(dirname "$_video_files_compactor_source")" && pwd -P
 )
 
-_video_splicer_state_file()
+_video_splice_state_file()
 {
     local state_dir
 
-    state_dir=${VIDEO_FILES_COMPACTOR_STATE_DIR:-"$HOME/Library/Application Support/video-files-compactor"}
+    state_dir=${VIDEO_FILES_COMPACTOR_STATE_DIR:-"$HOME/Library/Application Support/mac-video-files-compactor"}
     mkdir -p "$state_dir" || return 1
     printf '%s/last-spliced\n' "$state_dir"
 }
 
-_video_splicer_save()
+_video_splice_save()
 {
     local input=$1
     local state_file=$2
-    local stem extension original
-
-    if [ ! -f "$input" ]; then
-        echo "Not a file: $input" >&2
-        return 1
-    fi
+    local stem extension spliced original
 
     case $input in
         *-spliced.mov|*-spliced.mp4|*-spliced.MOV|*-spliced.MP4)
+            spliced=$input
+            ;;
+        *.mov|*.mp4|*.MOV|*.MP4)
+            stem=${input%.*}
+            extension=${input##*.}
+            spliced=$stem-spliced.$extension
             ;;
         *)
-            echo "Refusing to save: filename must end in -spliced.mov or -spliced.mp4" >&2
+            echo "Refusing to save: filename must end in .mov or .mp4" >&2
             return 2
             ;;
     esac
 
-    stem=${input%.*}
-    extension=${input##*.}
+    if [ ! -f "$spliced" ]; then
+        echo "Spliced file does not exist: $spliced" >&2
+        return 1
+    fi
+
+    stem=${spliced%.*}
+    extension=${spliced##*.}
     original=${stem%-spliced}.$extension
 
-    command mv -f "$input" "$original" || return 1
+    command mv -f "$spliced" "$original" || return 1
     printf '%s\n' "$original"
 
     if [ -n "$state_file" ]; then
@@ -407,12 +623,36 @@ _video_splicer_save()
     fi
 }
 
-video-splicer()
+video-splice()
 {
     local module_cache state_file input output status
 
+    if [ "$#" -eq 1 ] && [ "$1" = "open" ]; then
+        state_file=$(_video_splice_state_file) || return 1
+
+        if [ ! -s "$state_file" ]; then
+            echo "No recently spliced file is waiting to be opened." >&2
+            return 1
+        fi
+
+        IFS= read -r input < "$state_file"
+
+        if [ ! -f "$input" ]; then
+            echo "Remembered spliced file no longer exists: $input" >&2
+            return 1
+        fi
+
+        command -v open >/dev/null 2>&1 || {
+            echo "open not found" >&2
+            return 127
+        }
+
+        open "$input"
+        return
+    fi
+
     if [ "$#" -eq 1 ] && [ "$1" = "save" ]; then
-        state_file=$(_video_splicer_state_file) || return 1
+        state_file=$(_video_splice_state_file) || return 1
 
         if [ ! -s "$state_file" ]; then
             echo "No recently spliced file is waiting to be saved." >&2
@@ -420,20 +660,21 @@ video-splicer()
         fi
 
         IFS= read -r input < "$state_file"
-        _video_splicer_save "$input" "$state_file"
+        _video_splice_save "$input" "$state_file"
         return
     fi
 
     if [ "$#" -eq 2 ] && [ "$2" = "save" ]; then
-        state_file=$(_video_splicer_state_file) || return 1
-        _video_splicer_save "$1" "$state_file"
+        state_file=$(_video_splice_state_file) || return 1
+        _video_splice_save "$1" "$state_file"
         return
     fi
 
     if [ "$#" -lt 2 ]; then
-        echo "Usage: video-splicer FILENAME START,END [START,END ...] [FINAL_START]" >&2
-        echo "       video-splicer save" >&2
-        echo "       video-splicer FILENAME-spliced.mov save" >&2
+        echo "Usage: video-splice FILENAME START,END [START,END ...] [FINAL_START]" >&2
+        echo "       video-splice open" >&2
+        echo "       video-splice save" >&2
+        echo "       video-splice FILENAME[-spliced].mov save" >&2
         return 2
     fi
 
@@ -442,12 +683,12 @@ video-splicer()
         return 127
     }
 
-    module_cache=${TMPDIR:-/tmp}/video-splicer-module-cache
+    module_cache=${TMPDIR:-/tmp}/video-splice-module-cache
     mkdir -p "$module_cache" || return 1
 
     output=$(
         swift -module-cache-path "$module_cache" \
-            "$_video_files_compactor_dir/video-splicer.swift" "$@"
+            "$_video_files_compactor_dir/video-splice.swift" "$@"
     )
     status=$?
     printf '%s\n' "$output"
@@ -457,9 +698,11 @@ video-splicer()
     fi
 
     input=${output%%$'\n'*}
-    state_file=$(_video_splicer_state_file) || return 1
+    state_file=$(_video_splice_state_file) || return 1
     printf '%s\n' "$input" > "$state_file"
 }
+
+alias video-splicer='video-splice'
 
 video-concat()
 {
@@ -475,7 +718,7 @@ video-concat()
         return 127
     }
 
-    module_cache=${TMPDIR:-/tmp}/video-splicer-module-cache
+    module_cache=${TMPDIR:-/tmp}/video-splice-module-cache
     mkdir -p "$module_cache" || return 1
 
     swift -module-cache-path "$module_cache" \
